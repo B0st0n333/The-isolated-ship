@@ -1,0 +1,1432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Spaceship</title>
+<style>
+  :root {
+    --page: #e9ecf2;
+    --ink: #1c2233;
+    --btn: #ffffff;
+    --btn-border: #b9c0d0;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --page: #12141c; --ink: #dfe4f2; --btn: #1d2130; --btn-border: #3a4158;
+    }
+  }
+  :root[data-theme="dark"] {
+    --page: #12141c; --ink: #dfe4f2; --btn: #1d2130; --btn-border: #3a4158;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html { scroll-padding-top: env(safe-area-inset-top, 0px); }
+  body {
+    margin: 0; min-height: 100vh; background: var(--page); color: var(--ink);
+    font-family: "Trebuchet MS", "Segoe UI", Tahoma, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; padding: 16px;
+  }
+  #frame {
+    width: min(92vw, 62vh, 520px);
+    aspect-ratio: 1 / 1;
+    padding: 2px;
+    border-radius: 0;
+    overflow: hidden;
+    background: linear-gradient(135deg, #ff3b3b, #ff9a3c, #ffe14d, #4cd964, #34c8ff, #5b6cff, #b05cff);
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+  .hint { margin: 0; font-size: 14px; opacity: .75; text-align: center; }
+  .pad {
+    display: grid; gap: 8px;
+    grid-template-columns: repeat(3, 64px);
+    grid-template-rows: repeat(2, 64px);
+    touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  .pad button {
+    font-size: 26px; background: var(--btn); color: var(--ink);
+    border: 2px solid var(--btn-border); border-radius: 10px; cursor: pointer;
+    touch-action: none;
+  }
+  .pad button:active, .pad button.on { background: var(--ink); color: var(--page); }
+  .pad button:focus-visible { outline: 3px solid #4f8cff; outline-offset: 2px; }
+  #up { grid-column: 2; grid-row: 1; }
+  #left { grid-column: 1; grid-row: 2; }
+  #down { grid-column: 2; grid-row: 2; }
+  #right { grid-column: 3; grid-row: 2; }
+  #fire { grid-column: 3; grid-row: 1; font-size: 14px; font-weight: bold; }
+</style>
+</head>
+<body>
+  <div id="frame"><canvas id="c" width="520" height="520"></canvas></div>
+  <p class="hint">Left/Right turn, Up thrust, Down brake. Avoid the rocks and the UFO. Grab power-ups, press Space to fire! (H shows hitboxes)</p>
+  <div class="pad" aria-label="Controls">
+    <button id="up" aria-label="Up">▲</button>
+    <button id="left" aria-label="Left">◀</button>
+    <button id="down" aria-label="Down">▼</button>
+    <button id="right" aria-label="Right">▶</button>
+    <button id="fire" aria-label="Fire">FIRE</button>
+  </div>
+
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height;
+
+  // Starfield: 3 layers that drift for a bit of depth
+  var layers = [
+    { n: 70, size: 1,   speed: 8,  alpha: 0.45 },
+    { n: 40, size: 1.6, speed: 18, alpha: 0.7 },
+    { n: 18, size: 2.4, speed: 34, alpha: 1 }
+  ];
+  var stars = [];
+  layers.forEach(function (L) {
+    for (var i = 0; i < L.n; i++) {
+      stars.push({ x: Math.random() * W, y: Math.random() * H, L: L,
+                   tw: Math.random() * Math.PI * 2 });
+    }
+  });
+
+  // Ship
+  var ship = { x: W / 2, y: H / 2, vx: 0, vy: 0, angle: -Math.PI / 2, spin: 0, turnAccel: 12, accel: 112, maxSpeed: 120, r: 16 };
+  var keys = { up: false, down: false, left: false, right: false };
+
+  var map = {
+    ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+    ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right'
+  };
+  window.addEventListener('keydown', function (e) {
+    if (map[e.code]) { keys[map[e.code]] = true; e.preventDefault(); }
+  });
+  window.addEventListener('keyup', function (e) {
+    if (map[e.code]) { keys[map[e.code]] = false; e.preventDefault(); }
+  });
+  window.addEventListener('blur', function () {
+    keys.up = keys.down = keys.left = keys.right = false;
+  });
+
+  ['up', 'down', 'left', 'right'].forEach(function (d) {
+    var b = document.getElementById(d);
+    function on(e) { keys[d] = true; b.classList.add('on'); e.preventDefault(); }
+    function off(e) { keys[d] = false; b.classList.remove('on'); e.preventDefault(); }
+    b.addEventListener('pointerdown', on);
+    b.addEventListener('pointerup', off);
+    b.addEventListener('pointerleave', off);
+    b.addEventListener('pointercancel', off);
+  });
+
+  // Particles (exhaust fire, smoke, brake puffs)
+  var particles = [], emitAcc = 0, brakeAcc = 0;
+  var fireStops = [
+    [0.0, 255, 245, 200, 1.0],
+    [0.3, 255, 150, 40, 0.85],
+    [0.7, 200, 60, 30, 0.45],
+    [1.0, 90, 80, 90, 0.0]
+  ];
+  function fireColor(t) {
+    for (var k = 1; k < fireStops.length; k++) {
+      if (t <= fireStops[k][0]) {
+        var a = fireStops[k - 1], b = fireStops[k];
+        var u = (t - a[0]) / (b[0] - a[0]);
+        return [a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u,
+                a[3] + (b[3] - a[3]) * u, a[4] + (b[4] - a[4]) * u];
+      }
+    }
+    return [90, 80, 90, 0];
+  }
+
+  // Rocks: floating 3D asteroids. Hit one and it's game over.
+  var rocks = [], over = false, overAt = 0, survived = 0, best = 0, spawnTimer = 0;
+  var ufos = [], ufoWarn = 0, lasers = [], ufoWarnText = 'UFO incoming!', ufoNext2 = 0, rateStep = 0;
+  var level = 1, rocket = null, warpT = 0, levelStart = 0, ufoNext3 = 0, flashT = 0, won = false;
+  var beams = [], waveT = 0, waveN = 0, flashText = 'LEVEL 3';
+  var started = false, newRecord = false;
+  var lives = 1, ammo = 0, shield = 0, invuln = 0, gimmickT = 0, ufoNext = 0, fireCd = 0;
+  var pickups = [], bullets = [], toastText = '', toastT = 0;
+  var STORE_KEY = 'spaceship-best-time';
+  try { best = parseFloat(localStorage.getItem(STORE_KEY)) || 0; } catch (err) { best = 0; }
+  var LIGHT = -Math.PI * 0.75; // light comes from the top-left
+
+  function makeRock(avoidX, avoidY) {
+    var r = (level >= 2 ? 46 + Math.random() * 12 : 26 + Math.random() * 26), x, y, tries = 0;
+    do {
+      x = Math.random() * W; y = Math.random() * H; tries++;
+    } while (Math.hypot(x - avoidX, y - avoidY) < 170 && tries < 30);
+    var n = 9 + Math.floor(Math.random() * 4), verts = [];
+    for (var i = 0; i < n; i++) verts.push(0.72 + Math.random() * 0.38);
+    var dir = Math.random() * Math.PI * 2, sp = level >= 2 ? (6 + Math.random() * 14) * 1.4 : 10 + Math.random() * 28;
+    return {
+      x: x, y: y, r: r, verts: verts,
+      rot: Math.random() * Math.PI * 2, spin: (Math.random() - 0.5) * 0.9,
+      vx: Math.cos(dir) * sp, vy: Math.sin(dir) * sp,
+      hue: 20 + Math.random() * 25, gen: 0, cd: 0
+    };
+  }
+
+  function drawRock(k) {
+    var n = k.verts.length, pts = [], i;
+    for (i = 0; i < n; i++) {
+      var a = k.rot + (i / n) * Math.PI * 2;
+      pts.push([k.x + Math.cos(a) * k.r * k.verts[i], k.y + Math.sin(a) * k.r * k.verts[i]]);
+    }
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    for (i = 0; i < n; i++) {
+      if (i === 0) ctx.moveTo(pts[i][0] + 3, pts[i][1] + 4); else ctx.lineTo(pts[i][0] + 3, pts[i][1] + 4);
+    }
+    ctx.closePath();
+    ctx.fill();
+    // Facets fan out from a point shifted toward the light, so the rock looks like a dome
+    var cx = k.x + Math.cos(LIGHT) * k.r * 0.28, cy = k.y + Math.sin(LIGHT) * k.r * 0.28;
+    for (var j = 0; j < n; j++) {
+      var p1 = pts[j], p2 = pts[(j + 1) % n];
+      var mid = k.rot + ((j + 0.5) / n) * Math.PI * 2;
+      var b = 0.5 + 0.5 * Math.cos(mid - LIGHT);
+      var lum = 16 + b * 42 + ((j * 7) % 3) * 2.5;
+      var col = 'hsl(' + k.hue.toFixed(0) + ',14%,' + lum.toFixed(1) + '%)';
+      ctx.fillStyle = col;
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 0.6;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy); ctx.lineTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+    // Rim light
+    ctx.strokeStyle = 'rgba(255,235,210,0.25)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (i = 0; i < n; i++) {
+      if (i === 0) ctx.moveTo(pts[i][0], pts[i][1]); else ctx.lineTo(pts[i][0], pts[i][1]);
+    }
+    ctx.closePath();
+    ctx.stroke();
+  }
+
+  // Hitboxes follow each rock's real outline
+  var showHit = false;
+  function rockEdge(k, ang) {
+    var n = k.verts.length, TAU = Math.PI * 2;
+    var t = (((ang - k.rot) % TAU) + TAU) % TAU / TAU * n;
+    var i = Math.floor(t) % n, f = t - Math.floor(t);
+    return k.r * (k.verts[i] * (1 - f) + k.verts[(i + 1) % n] * f) * 1.1;
+  }
+  function hits(px, py, pr, k) {
+    var d = Math.hypot(px - k.x, py - k.y);
+    return d < rockEdge(k, Math.atan2(py - k.y, px - k.x)) + pr;
+  }
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'KeyH') showHit = !showHit;
+  });
+
+  // UFO: metallic disc with a glass dome and blinking lights
+  function drawUfo(u) {
+    var x = u.x, y = u.y + Math.sin(u.t * 3) * 1.5; // gentle bob
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(x + 4, y + 14, 26, 7, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Glass dome
+    var dg = ctx.createLinearGradient(x, y - 16, x, y);
+    var second = u.slot % 3 === 1, third = u.slot % 3 === 2; // UFO colors cycle: blue, green, red
+    dg.addColorStop(0, third ? 'rgba(255,205,205,0.95)' : (second ? 'rgba(220,255,200,0.95)' : 'rgba(200,245,255,0.95)'));
+    dg.addColorStop(1, third ? 'rgba(190,60,60,0.9)' : (second ? 'rgba(70,170,90,0.9)' : 'rgba(60,130,200,0.9)'));
+    ctx.fillStyle = dg;
+    ctx.beginPath();
+    ctx.ellipse(x, y - 3, 12, 12, 0, Math.PI, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.beginPath();
+    ctx.ellipse(x - 4, y - 11, 3.5, 2, -0.5, 0, Math.PI * 2);
+    ctx.fill();
+    // Disc body
+    var bg = ctx.createLinearGradient(x, y - 9, x, y + 9);
+    bg.addColorStop(0, '#e6ecf7');
+    bg.addColorStop(0.5, '#8d9bb8');
+    bg.addColorStop(1, '#3a4260');
+    ctx.fillStyle = bg;
+    ctx.beginPath();
+    ctx.ellipse(x, y, 27, 9, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(220,235,255,0.7)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    // Blinking rim lights
+    for (var i = 0; i < 5; i++) {
+      var on = (Math.floor(u.t * 6) + i) % 2 === 0;
+      ctx.fillStyle = on ? '#ffe14a' : '#ff5470';
+      ctx.beginPath();
+      ctx.arc(x - 16 + i * 8, y + 2.5, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Laser charging glow
+    if (u.charge > 0) {
+      ctx.globalCompositeOperation = 'lighter';
+      var cg = ctx.createRadialGradient(x, y + 9, 1, x, y + 9, 6 + 14 * u.charge);
+      cg.addColorStop(0, 'rgba(255,90,110,' + (0.5 + 0.5 * u.charge).toFixed(2) + ')');
+      cg.addColorStop(1, 'rgba(255,40,80,0)');
+      ctx.fillStyle = cg;
+      ctx.beginPath();
+      ctx.arc(x, y + 9, 6 + 14 * u.charge, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  // Particle burst helper (kind: 'fire', 'cool' or 'rock')
+  function burst(x, y, n, kind, spd) {
+    spd = spd || 120;
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, s = 15 + Math.random() * spd;
+      particles.push({
+        x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0,
+        max: 0.4 + Math.random() * 0.7,
+        size: (kind === 'rock' ? 1.2 : 0.7) + Math.random() * 1.4,
+        cool: kind === 'cool', rock: kind === 'rock'
+      });
+    }
+  }
+  function breakRock(k) { burst(k.x, k.y, 26, 'rock', 110); }
+
+  // Taking a hit: lose a life, or game over on the last one
+  function hurt() {
+    if (shield > 0 || invuln > 0 || over) return;
+    lives--;
+    if (lives <= 0) { crash(); return; }
+    invuln = 2;
+    burst(ship.x, ship.y, 30, 'fire', 140);
+    toastText = 'LIFE LOST'; toastT = 1.4;
+  }
+
+  // Gimmicks (power-ups): ammo, extra life, invincibility
+  function spawnPickup() {
+    var types = ['ammo', 'life', 'shield'];
+    var x, y, tries = 0;
+    do {
+      x = 40 + Math.random() * (W - 80);
+      y = 50 + Math.random() * (H - 90);
+      tries++;
+    } while (Math.hypot(x - ship.x, y - ship.y) < 90 && tries < 30);
+    pickups.push({ type: types[Math.floor(Math.random() * 3)], x: x, y: y, life: 0, max: 7 });
+  }
+
+  function drawPickup(p) {
+    var left = p.max - p.life;
+    if (left < 2 && Math.floor(p.life * 8) % 2 === 0) return; // blinks before it disappears
+    var x = p.x, y = p.y + Math.sin(p.life * 4) * 2;
+    var col = p.type === 'ammo' ? '255,179,71' : (p.type === 'life' ? '255,84,112' : '255,225,74');
+    ctx.globalCompositeOperation = 'lighter';
+    var gg = ctx.createRadialGradient(x, y, 2, x, y, 26);
+    gg.addColorStop(0, 'rgba(' + col + ',0.55)');
+    gg.addColorStop(1, 'rgba(' + col + ',0)');
+    ctx.fillStyle = gg;
+    ctx.beginPath(); ctx.arc(x, y, 26, 0, Math.PI * 2); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = 'rgba(10,14,40,0.88)';
+    ctx.beginPath(); ctx.arc(x, y, 14, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgb(' + col + ')';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // Countdown ring: shrinks as the 7 seconds run out
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(x, y, 18, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (left / p.max));
+    ctx.stroke();
+    ctx.fillStyle = 'rgb(' + col + ')';
+    if (p.type === 'ammo') {
+      for (var bi2 = -1; bi2 <= 1; bi2++) ctx.fillRect(x + bi2 * 5 - 1.5, y - 6, 3, 12);
+    } else if (p.type === 'life') {
+      ctx.beginPath();
+      ctx.moveTo(x, y + 6);
+      ctx.bezierCurveTo(x - 10, y - 1, x - 6, y - 9, x, y - 3);
+      ctx.bezierCurveTo(x + 6, y - 9, x + 10, y - 1, x, y + 6);
+      ctx.fill();
+    } else {
+      ctx.beginPath();
+      for (var si = 0; si < 10; si++) {
+        var rad = si % 2 === 0 ? 8 : 3.5, ang = -Math.PI / 2 + si * Math.PI / 5;
+        if (si === 0) ctx.moveTo(x + Math.cos(ang) * rad, y + Math.sin(ang) * rad);
+        else ctx.lineTo(x + Math.cos(ang) * rad, y + Math.sin(ang) * rad);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  // Shooting (only with ammo)
+  function fire() {
+    if (!started || over || ammo <= 0 || fireCd > 0) return;
+    ammo--; fireCd = 0.2;
+    var cx2 = Math.cos(ship.angle), cy2 = Math.sin(ship.angle);
+    bullets.push({ x: ship.x + cx2 * 24, y: ship.y + cy2 * 24, vx: cx2 * 380 + ship.vx, vy: cy2 * 380 + ship.vy, life: 0 });
+  }
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' && started && !over) { e.preventDefault(); if (!e.repeat) fire(); }
+  });
+  document.getElementById('fire').addEventListener('pointerdown', function (e) {
+    e.preventDefault(); fire();
+  });
+
+  // Breaking rocks: a rock splits in half, up to 3 times (gen 0 -> 3)
+  function makePiece(x, y, r, gen, hue, vx, vy) {
+    var n = 8 + Math.floor(Math.random() * 3), verts = [];
+    for (var i = 0; i < n; i++) verts.push(0.72 + Math.random() * 0.38);
+    return {
+      x: x, y: y, r: r, verts: verts,
+      rot: Math.random() * Math.PI * 2, spin: (Math.random() - 0.5) * 1.4,
+      vx: vx, vy: vy, hue: hue, gen: gen, cd: 0.8
+    };
+  }
+  function splitRock(k) {
+    if (k.gen >= (level === 4 ? 1 : 3)) return null; // max breaks: once in the boss fight, 3 times elsewhere
+    var r2 = k.r * 0.7, base = Math.atan2(k.vy, k.vx) + Math.PI / 2, out = [];
+    for (var s = 0; s < 2; s++) {
+      var ang = base + (s === 0 ? 0 : Math.PI) + (Math.random() - 0.5) * 0.5;
+      var kick = 12 + Math.random() * 10;
+      out.push(makePiece(
+        k.x + Math.cos(ang) * r2 * 0.5, k.y + Math.sin(ang) * r2 * 0.5,
+        r2, k.gen + 1, k.hue,
+        k.vx * 0.5 + Math.cos(ang) * kick, k.vy * 0.5 + Math.sin(ang) * kick
+      ));
+    }
+    return out;
+  }
+  // Break the rock at index idx (bullets and ship hits)
+  function shatter(k, idx) {
+    breakRock(k);
+    var ps = splitRock(k);
+    rocks.splice(idx, 1);
+    if (ps) { rocks.push(ps[0]); rocks.push(ps[1]); }
+  }
+
+  // Big rocket that takes you to level 2
+  function drawRocket(r) {
+    var x = r.x, y = r.y + Math.sin(r.t * 2.5) * 3;
+    // Pulsing green aura so you can spot it
+    ctx.globalCompositeOperation = 'lighter';
+    var pr = 52 + Math.sin(r.t * 4) * 5;
+    var ag = ctx.createRadialGradient(x, y, 10, x, y, pr);
+    ag.addColorStop(0, 'rgba(110,255,160,0.28)');
+    ag.addColorStop(1, 'rgba(110,255,160,0)');
+    ctx.fillStyle = ag;
+    ctx.beginPath(); ctx.arc(x, y, pr, 0, Math.PI * 2); ctx.fill();
+    // Flame
+    var fl = 18 + Math.random() * 10;
+    var fg = ctx.createLinearGradient(x, y + 28, x, y + 28 + fl + 14);
+    fg.addColorStop(0, 'rgba(255,240,180,0.95)');
+    fg.addColorStop(0.5, 'rgba(255,140,40,0.8)');
+    fg.addColorStop(1, 'rgba(255,60,20,0)');
+    ctx.fillStyle = fg;
+    ctx.beginPath();
+    ctx.moveTo(x - 9, y + 28); ctx.lineTo(x, y + 28 + fl + 14); ctx.lineTo(x + 9, y + 28);
+    ctx.closePath(); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+    // Fins
+    ctx.fillStyle = '#c8283f';
+    ctx.beginPath(); ctx.moveTo(x - 14, y + 4); ctx.lineTo(x - 28, y + 32); ctx.lineTo(x - 14, y + 28); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#8f1c2f';
+    ctx.beginPath(); ctx.moveTo(x + 14, y + 4); ctx.lineTo(x + 28, y + 32); ctx.lineTo(x + 14, y + 28); ctx.closePath(); ctx.fill();
+    // Body (lit on the left, shaded on the right)
+    var rb = ctx.createLinearGradient(x - 15, 0, x + 15, 0);
+    rb.addColorStop(0, '#ffffff'); rb.addColorStop(0.55, '#d3dcf0'); rb.addColorStop(1, '#6f7fa8');
+    ctx.fillStyle = rb;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 44);
+    ctx.quadraticCurveTo(x + 17, y - 22, x + 15, y - 8);
+    ctx.lineTo(x + 15, y + 28); ctx.lineTo(x - 15, y + 28); ctx.lineTo(x - 15, y - 8);
+    ctx.quadraticCurveTo(x - 17, y - 22, x, y - 44);
+    ctx.closePath(); ctx.fill();
+    // Red nose cone
+    ctx.fillStyle = '#e03550';
+    ctx.beginPath();
+    ctx.moveTo(x, y - 44);
+    ctx.quadraticCurveTo(x + 11, y - 30, x + 12, y - 21);
+    ctx.lineTo(x - 12, y - 21);
+    ctx.quadraticCurveTo(x - 11, y - 30, x, y - 44);
+    ctx.closePath(); ctx.fill();
+    // Window
+    var rw2 = ctx.createRadialGradient(x - 2, y - 6, 1, x, y - 4, 8);
+    rw2.addColorStop(0, '#d8f6ff'); rw2.addColorStop(1, '#2a6fb0');
+    ctx.fillStyle = rw2;
+    ctx.beginPath(); ctx.arc(x, y - 4, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#6f7fa8'; ctx.lineWidth = 2; ctx.stroke();
+    // Stripe, nozzle and label
+    ctx.fillStyle = '#e03550'; ctx.fillRect(x - 15, y + 12, 30, 5);
+    ctx.fillStyle = '#4a5270'; ctx.fillRect(x - 7, y + 28, 14, 4);
+    ctx.fillStyle = '#9dffbe';
+    ctx.font = 'bold 13px "Trebuchet MS", "Segoe UI", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('LEVEL 2', x, y - 56);
+  }
+
+  // Level 2: purple space, faster rocks, and two UFOs
+  function startLevel2(bonus) {
+    if (bonus) lives = Math.min(lives + 1, 5); // clearing a level gives +1 life
+    level = 2;
+    levelStart = survived;
+    rocket = null;
+    rocks = [];
+    // Level 2 rocks start at random spots, but far from each other
+    for (var i = 0; i < 3; i++) {
+      var cand, spaced, tries2 = 0;
+      do {
+        cand = makeRock(ship.x, ship.y);
+        spaced = true;
+        for (var j = 0; j < rocks.length; j++) {
+          if (Math.hypot(cand.x - rocks[j].x, cand.y - rocks[j].y) < 200) { spaced = false; break; }
+        }
+        tries2++;
+      } while (!spaced && tries2 < 80);
+      cand.home = true; // at the start of level 2 every big rock rushes to the center first
+      rocks.push(cand);
+    }
+    ufos.length = 0; lasers.length = 0; bullets.length = 0; pickups.length = 0;
+    ufoNext = 0; ufoNext2 = 0; ufoNext3 = 0;
+    shield = 0; invuln = 2.5; gimmickT = 0;
+    toastText = 'LEVEL 2: big rocks + 2 UFOs!' + (bonus ? ' +1 LIFE' : ''); toastT = 2.5;
+  }
+
+  // Winning: finish The Final Boss
+  function win() {
+    over = true; won = true; overAt = performance.now();
+    newRecord = survived > best;
+    if (newRecord) {
+      best = survived;
+      try { localStorage.setItem(STORE_KEY, String(best)); } catch (err) {}
+    }
+    lasers.length = 0;
+    burst(ship.x, ship.y, 50, 'cool', 160);
+  }
+
+  // Level 3: red space, only UFOs (2 at first, +1 every 13 seconds), lasts 60 seconds
+  function startLevel3(bonus) {
+    if (bonus) lives = Math.min(lives + 1, 5); // clearing a level gives +1 life
+    level = 3;
+    levelStart = survived;
+    rocket = null;
+    rocks = [];
+    // No rocks in level 3: only UFOs
+    ufos.length = 0; lasers.length = 0; bullets.length = 0; pickups.length = 0;
+    ufoNext = 0; ufoNext2 = 0; ufoNext3 = 0;
+    shield = 0; invuln = 2.5; gimmickT = 0;
+    flashT = 0.7; flashText = 'LEVEL 3';
+    toastText = 'LEVEL 3: UFOs dodge you!' + (bonus ? ' +1 LIFE' : ''); toastT = 2.5;
+  }
+
+  // Level 4: The Final Boss - a laser maze plus 3 big rocks, lasts 30 seconds
+  function startLevel4(bonus) {
+    if (bonus) lives = Math.min(lives + 1, 5); // clearing a level gives +1 life
+    level = 4;
+    levelStart = survived;
+    rocket = null;
+    rocks = [];
+    for (var i = 0; i < 3; i++) {
+      var cand, spaced, tries4 = 0;
+      do {
+        cand = makeRock(ship.x, ship.y);
+        spaced = true;
+        for (var j = 0; j < rocks.length; j++) {
+          if (Math.hypot(cand.x - rocks[j].x, cand.y - rocks[j].y) < 200) { spaced = false; break; }
+        }
+        tries4++;
+      } while (!spaced && tries4 < 80);
+      cand.home = true; // boss fight: the rocks rush to the middle first
+      rocks.push(cand);
+    }
+    ufos.length = 0; lasers.length = 0; bullets.length = 0; pickups.length = 0; beams.length = 0;
+    shield = 0; invuln = 2.5; gimmickT = 0;
+    waveT = 1.2; waveN = 0;
+    flashT = 0.7; flashText = 'THE FINAL BOSS';
+    toastText = 'FINAL BOSS: laser maze + rocks!' + (bonus ? ' +1 LIFE' : ''); toastT = 3;
+  }
+
+  function resetGame() {
+    ship.x = W / 2; ship.y = H / 2; ship.vx = 0; ship.vy = 0;
+    ship.spin = 0; ship.angle = -Math.PI / 2;
+    particles.length = 0;
+    rocks = [];
+    for (var i = 0; i < 6; i++) rocks.push(makeRock(W / 2, H / 2));
+    over = false; survived = 0; spawnTimer = 0;
+    ufos.length = 0; ufoWarn = 0; lasers.length = 0; newRecord = false; ufoNext2 = 0; rateStep = 0;
+    level = 1; rocket = null; warpT = 0; levelStart = 0; ufoNext3 = 0; flashT = 0; won = false;
+    beams.length = 0; waveT = 0; waveN = 0;
+    lives = 2; ammo = 0; shield = 0; invuln = 0; gimmickT = 0; ufoNext = 0; fireCd = 0;
+    pickups.length = 0; bullets.length = 0; toastT = 0;
+  }
+
+  function crash() {
+    over = true;
+    overAt = performance.now();
+    newRecord = survived > best;
+    if (newRecord) {
+      best = survived;
+      try { localStorage.setItem(STORE_KEY, String(best)); } catch (err) {}
+    }
+    for (var i = 0; i < 90; i++) {
+      var a = Math.random() * Math.PI * 2, s = 20 + Math.random() * 160;
+      particles.push({
+        x: ship.x, y: ship.y,
+        vx: ship.vx * 0.3 + Math.cos(a) * s, vy: ship.vy * 0.3 + Math.sin(a) * s,
+        life: 0, max: 0.6 + Math.random() * 0.9,
+        size: 0.7 + Math.random() * 1.6, cool: false
+      });
+    }
+    ship.vx = 0; ship.vy = 0;
+  }
+
+  function tryRestart() {
+    if (!started) { started = true; resetGame(); return; }
+    if (over && performance.now() - overAt > 600) resetGame();
+  }
+  window.addEventListener('keydown', function (e) {
+    if ((e.code === 'Space' || e.code === 'Enter') && (over || !started)) { e.preventDefault(); tryRestart(); }
+  });
+  canvas.addEventListener('pointerdown', tryRestart);
+
+  resetGame();
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    if (over || !started) { keys.up = keys.down = keys.left = keys.right = false; }
+    // Warp to level 2: the game freezes for a moment while the effect plays
+    var realDt = dt;
+    if (warpT > 0) {
+      warpT -= realDt;
+      dt = 0;
+      keys.up = keys.down = keys.left = keys.right = false;
+      if (warpT <= 0) startLevel2(true);
+    }
+
+    // Steering: the ship turns smoothly (no sudden snaps)
+    var turn = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+    ship.spin += turn * ship.turnAccel * dt;
+    ship.spin *= Math.pow(0.02, dt); // turning eases out when you let go
+    ship.angle += ship.spin * dt;
+
+    // Thrust only pushes in the direction the nose points
+    var moving = keys.up;
+    if (keys.up) {
+      ship.vx += Math.cos(ship.angle) * ship.accel * dt;
+      ship.vy += Math.sin(ship.angle) * ship.accel * dt;
+    }
+    // Brake
+    if (keys.down) {
+      var brake = Math.pow(0.12, dt);
+      ship.vx *= brake;
+      ship.vy *= brake;
+    }
+    // Drift: very little friction, so the ship keeps gliding
+    var drag = Math.pow(0.8, dt);
+    ship.vx *= drag;
+    ship.vy *= drag;
+    var sp = Math.hypot(ship.vx, ship.vy);
+    if (sp > ship.maxSpeed) {
+      ship.vx *= ship.maxSpeed / sp;
+      ship.vy *= ship.maxSpeed / sp;
+    }
+    ship.x += ship.vx * dt;
+    ship.y += ship.vy * dt;
+    // Wrap around: leave one side, come back on the opposite side
+    var m = ship.r + 4;
+    if (level >= 3) {
+      // Levels 3 and 4: solid walls, the ship bounces softly off them
+      if (ship.x < ship.r) { ship.x = ship.r; ship.vx = Math.abs(ship.vx) * 0.5; }
+      if (ship.x > W - ship.r) { ship.x = W - ship.r; ship.vx = -Math.abs(ship.vx) * 0.5; }
+      if (ship.y < ship.r) { ship.y = ship.r; ship.vy = Math.abs(ship.vy) * 0.5; }
+      if (ship.y > H - ship.r) { ship.y = H - ship.r; ship.vy = -Math.abs(ship.vy) * 0.5; }
+    } else {
+      if (ship.x < -m) ship.x = W + m;
+      if (ship.x > W + m) ship.x = -m;
+      if (ship.y < -m) ship.y = H + m;
+      if (ship.y > H + m) ship.y = -m;
+    }
+
+    // Background
+    var g = ctx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, W * 0.75);
+    g.addColorStop(0, level === 4 ? '#06242a' : (level === 3 ? '#40101c' : (level === 2 ? '#2d1040' : '#0d1230')));
+    g.addColorStop(1, level === 4 ? '#010608' : (level === 3 ? '#12020a' : (level === 2 ? '#08020f' : '#03040a')));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // Stars drift downward slowly
+    stars.forEach(function (s) {
+      s.y += s.L.speed * dt;
+      if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+      s.tw += dt * 2;
+      var a = s.L.alpha * (0.7 + 0.3 * Math.sin(s.tw));
+      ctx.fillStyle = 'rgba(255,255,255,' + a.toFixed(3) + ')';
+      ctx.fillRect(s.x, s.y, s.L.size, s.L.size);
+    });
+
+    // Rocks: drift, spin, wrap around, and check for crashes
+    if (!over && started) {
+      survived += dt;
+      spawnTimer += dt;
+      if (level >= 2 && rocks.length >= (level === 3 ? 0 : 3)) spawnTimer = 0;
+      if (level >= 2 ? (spawnTimer > 2.5 && rocks.length < (level === 3 ? 0 : 3)) : (spawnTimer > (rocks.length < 5 ? 2.5 : 8) && rocks.length < 10)) {
+        spawnTimer = 0;
+        rocks.push(makeRock(ship.x, ship.y));
+      }
+    }
+    // Levels 2 and 3 only - rock vs rock: they bounce and break in half (up to 3 breaks per rock)
+    if (level >= 2 && !over && started && warpT <= 0) {
+      for (var qi = 0; qi < rocks.length; qi++) { if (rocks[qi].cd > 0) rocks[qi].cd -= dt; }
+      var hitPairs = [];
+      for (var ra = 0; ra < rocks.length; ra++) {
+        for (var rb = ra + 1; rb < rocks.length; rb++) {
+          var A = rocks[ra], B = rocks[rb];
+          if (A.cd > 0 || B.cd > 0) continue;
+          var ddx = B.x - A.x, ddy = B.y - A.y, dd = Math.hypot(ddx, ddy) || 1;
+          if (dd < (A.r + B.r) * 0.8) hitPairs.push([A, B, ddx / dd, ddy / dd]);
+        }
+      }
+      var fresh = [];
+      for (var hp = 0; hp < hitPairs.length; hp++) {
+        var A2 = hitPairs[hp][0], B2 = hitPairs[hp][1], nx2 = hitPairs[hp][2], ny2 = hitPairs[hp][3];
+        if (A2.cd > 0 || B2.cd > 0 || A2.dead || B2.dead) continue; // already handled this frame
+        var va = A2.vx * nx2 + A2.vy * ny2, vb = B2.vx * nx2 + B2.vy * ny2;
+        if (va > vb) { // only bounce if they are moving toward each other
+          A2.vx += (vb - va) * nx2; A2.vy += (vb - va) * ny2;
+          B2.vx += (va - vb) * nx2; B2.vy += (va - vb) * ny2;
+        }
+        A2.vx -= nx2 * 12; A2.vy -= ny2 * 12;
+        B2.vx += nx2 * 12; B2.vy += ny2 * 12;
+        A2.cd = 0.8; B2.cd = 0.8;
+        var pair = [A2, B2];
+        for (var pj = 0; pj < 2; pj++) {
+          var rk = pair[pj];
+          var ps = splitRock(rk);
+          if (ps) {
+            rk.dead = true;
+            burst(rk.x, rk.y, 14, 'rock', 90);
+            fresh.push(ps[0], ps[1]);
+          }
+        }
+      }
+      if (fresh.length) {
+        rocks = rocks.filter(function (rr) { return !rr.dead; }).concat(fresh);
+      }
+    }
+
+    for (var ri = 0; ri < rocks.length; ri++) {
+      var k = rocks[ri];
+      if (k.home) {
+        var hx = W / 2 - k.x, hy = H / 2 - k.y, hd = Math.hypot(hx, hy) || 1;
+        if (hd < 30) {
+          // Arrived at the center: crawl slowly, then speed back up to normal
+          k.home = false;
+          k.dirA = Math.random() * Math.PI * 2;
+          k.tgt = (6 + Math.random() * 14) * 1.4;
+          k.slowT = 1.5;
+          k.vx = Math.cos(k.dirA) * 4; k.vy = Math.sin(k.dirA) * 4;
+        } else {
+          // Rush in fast, but slow down as it nears the center
+          var hsp = Math.max(6, Math.min(45, (hd - 20) * 0.6));
+          k.vx = (hx / hd) * hsp; k.vy = (hy / hd) * hsp;
+        }
+      } else if (k.slowT > 0) {
+        k.slowT -= dt;
+        var sp3 = 4 + (k.tgt - 4) * (1 - Math.max(0, k.slowT) / 1.5);
+        k.vx = Math.cos(k.dirA) * sp3; k.vy = Math.sin(k.dirA) * sp3;
+      }
+      k.x += k.vx * dt; k.y += k.vy * dt; k.rot += k.spin * dt;
+      var mr = k.r * 1.1;
+      if (k.x < -mr) k.x = W + mr;
+      if (k.x > W + mr) k.x = -mr;
+      if (k.y < -mr) k.y = H + mr;
+      if (k.y > H + mr) k.y = -mr;
+      drawRock(k);
+      if (showHit) {
+        ctx.strokeStyle = 'rgba(255,60,60,0.9)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (var hi = 0; hi <= 48; hi++) {
+          var ha = (hi / 48) * Math.PI * 2;
+          var he = rockEdge(k, ha);
+          var hx = k.x + Math.cos(ha) * he, hy = k.y + Math.sin(ha) * he;
+          if (hi === 0) ctx.moveTo(hx, hy); else ctx.lineTo(hx, hy);
+        }
+        ctx.closePath();
+        ctx.stroke();
+      }
+      if (!over && started) {
+        var nx = ship.x + Math.cos(ship.angle) * 15, ny = ship.y + Math.sin(ship.angle) * 15;
+        if (hits(ship.x, ship.y, 11, k) || hits(nx, ny, 6, k)) {
+          if (shield > 0) {
+            breakRock(k); rocks.splice(ri, 1); ri--; continue;
+          } else if (invuln <= 0) {
+            hurt();
+            if (!over) {
+              if (level >= 2) shatter(k, ri); else { breakRock(k); rocks.splice(ri, 1); }
+              ri--; continue;
+            }
+          }
+        }
+      }
+    }
+
+    // Gimmicks: a power-up appears every 30 seconds and vanishes after 7 seconds
+    if (!over && started) {
+      gimmickT += dt;
+      if (level === 1 && gimmickT >= 30) { gimmickT = 0; spawnPickup(); } // no gimmick drops in levels 2 and 3
+      if (shield > 0) shield -= dt;
+      if (invuln > 0) invuln -= dt;
+      if (fireCd > 0) fireCd -= dt;
+      if (toastT > 0) toastT -= dt;
+    }
+    for (var gi = pickups.length - 1; gi >= 0; gi--) {
+      var gp = pickups[gi];
+      if (!over && started) gp.life += dt;
+      if (gp.life >= gp.max) { pickups.splice(gi, 1); continue; }
+      drawPickup(gp);
+      if (!over && started && Math.hypot(ship.x - gp.x, ship.y - gp.y) < 26) {
+        if (gp.type === 'ammo') { ammo += 3; toastText = '+3 AMMO (Space to fire)'; }
+        else if (gp.type === 'life') { lives = Math.min(lives + 1, 5); toastText = '+1 LIFE'; }
+        else { shield = 5; toastText = 'INVINCIBLE FOR 5s'; }
+        toastT = 1.8;
+        pickups.splice(gi, 1);
+      }
+    }
+
+    // Bullets: break rocks, but cannot break the UFO
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    for (var bi = bullets.length - 1; bi >= 0; bi--) {
+      var bu = bullets[bi];
+      if (!over) { bu.life += dt; bu.x += bu.vx * dt; bu.y += bu.vy * dt; }
+      if (bu.life > 1.4 || bu.x < -10 || bu.x > W + 10 || bu.y < -10 || bu.y > H + 10) {
+        bullets.splice(bi, 1);
+        continue;
+      }
+      var bsp = Math.hypot(bu.vx, bu.vy);
+      var btx = bu.x - (bu.vx / bsp) * 12, bty = bu.y - (bu.vy / bsp) * 12;
+      ctx.strokeStyle = 'rgba(255,190,70,0.45)';
+      ctx.lineWidth = 6;
+      ctx.beginPath(); ctx.moveTo(btx, bty); ctx.lineTo(bu.x, bu.y); ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,255,230,0.95)';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(btx, bty); ctx.lineTo(bu.x, bu.y); ctx.stroke();
+      var gone = false;
+      for (var bk = 0; bk < rocks.length; bk++) {
+        if (hits(bu.x, bu.y, 3, rocks[bk])) {
+          if (level >= 2) shatter(rocks[bk], bk); else { breakRock(rocks[bk]); rocks.splice(bk, 1); }
+          gone = true;
+          break;
+        }
+      }
+      if (!gone) {
+        for (var bu2 = 0; bu2 < ufos.length; bu2++) {
+          if (Math.hypot(bu.x - ufos[bu2].x, bu.y - ufos[bu2].y) < 26) {
+            burst(bu.x, bu.y, 8, 'cool', 90); // the UFO shrugs it off
+            gone = true;
+            break;
+          }
+        }
+      }
+      if (gone) bullets.splice(bi, 1);
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.lineCap = 'butt';
+
+    // UFO: arrives after 60 seconds and shoots lasers at you
+    // After 30 seconds in level 2: instant teleport to level 3
+    if (!over && started && level === 2 && warpT <= 0 && survived - levelStart >= 30) startLevel3(true);
+    if (!over && started && level === 3 && survived - levelStart >= 60) startLevel4(true);
+    if (!over && started && level === 4 && survived - levelStart >= 30) win();
+
+    // Big rocket: appears at 60 seconds (the end of level 1), fly into it to reach level 2
+    if (!over && started && level === 1 && !rocket && warpT <= 0 && survived >= 60) {
+      var rx, ry, rtries = 0;
+      do {
+        rx = 80 + Math.random() * (W - 160);
+        ry = 110 + Math.random() * (H - 200);
+        rtries++;
+      } while (Math.hypot(rx - ship.x, ry - ship.y) < 160 && rtries < 30);
+      rocket = { x: rx, y: ry, t: 0 };
+      toastText = 'ROCKET! Fly into it for LEVEL 2'; toastT = 3;
+    }
+    if (rocket) {
+      if (!over) rocket.t += dt;
+      drawRocket(rocket);
+      if (!over && started && warpT <= 0 && Math.hypot(ship.x - rocket.x, ship.y - rocket.y) < 38) {
+        warpT = 1.8;
+        invuln = 2.5;
+        shield = 0;
+      }
+    }
+
+    // Fire rate goes up every 30 seconds after the 2 minute mark
+    var fireSteps = survived >= 120 ? Math.floor((survived - 120) / 30) : 0;
+    var fireRate = level === 3 ? 1 : 1 + 0.3 * fireSteps;
+    if (!over && started && level < 3 && fireSteps > rateStep) {
+      rateStep = fireSteps;
+      toastText = 'UFOs FIRE FASTER!'; toastT = 1.8;
+    }
+    // Level 4 (The Final Boss): a laser maze
+    if (level === 4) {
+      if (!over && started) {
+        waveT -= dt;
+        if (waveT <= 0) {
+          waveT = 4.2;
+          var wk = waveN % 4; waveN++;
+          var off, bi3;
+          if (wk === 0) { // rows of beams
+            off = 40 + Math.random() * 70;
+            for (bi3 = 0; bi3 < 4; bi3++) beams.push({ kind: 'h', pos: off + bi3 * 110, t: 0, warn: 1.0, on: 1.3 });
+          } else if (wk === 1) { // columns of beams
+            off = 40 + Math.random() * 70;
+            for (bi3 = 0; bi3 < 4; bi3++) beams.push({ kind: 'v', pos: off + bi3 * 110, t: 0, warn: 1.0, on: 1.3 });
+          } else if (wk === 2) { // a spinning beam through the center
+            beams.push({ kind: 'r', ang: Math.random() * Math.PI, spin: (Math.random() < 0.5 ? -1 : 1) * 0.7, t: 0, warn: 1.0, on: 3.6 });
+          } else { // a full grid: the maze
+            off = 50 + Math.random() * 40;
+            for (bi3 = 0; bi3 < 3; bi3++) {
+              beams.push({ kind: 'h', pos: off + bi3 * 170, t: 0, warn: 1.0, on: 1.3 });
+              beams.push({ kind: 'v', pos: off + bi3 * 170, t: 0, warn: 1.0, on: 1.3 });
+            }
+          }
+        }
+      }
+      ctx.globalCompositeOperation = 'lighter';
+      for (var bm = beams.length - 1; bm >= 0; bm--) {
+        var B3 = beams[bm];
+        if (!over && started) B3.t += dt;
+        if (B3.t > B3.warn + B3.on) { beams.splice(bm, 1); continue; }
+        var active = B3.t >= B3.warn;
+        if (B3.kind === 'r' && active && !over) B3.ang += B3.spin * dt;
+        var bx1, by1, bx2, by2;
+        if (B3.kind === 'h') { bx1 = 0; by1 = B3.pos; bx2 = W; by2 = B3.pos; }
+        else if (B3.kind === 'v') { bx1 = B3.pos; by1 = 0; bx2 = B3.pos; by2 = H; }
+        else {
+          var bcs = Math.cos(B3.ang), bsn = Math.sin(B3.ang);
+          bx1 = W / 2 - bcs * 400; by1 = H / 2 - bsn * 400;
+          bx2 = W / 2 + bcs * 400; by2 = H / 2 + bsn * 400;
+        }
+        if (!active) { // warning: thin blinking dashed line
+          ctx.strokeStyle = 'rgba(255,80,100,' + (Math.floor(B3.t * 10) % 2 === 0 ? 0.6 : 0.25) + ')';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([8, 8]);
+          ctx.beginPath(); ctx.moveTo(bx1, by1); ctx.lineTo(bx2, by2); ctx.stroke();
+          ctx.setLineDash([]);
+        } else { // deadly beam
+          ctx.strokeStyle = 'rgba(255,40,80,0.4)';
+          ctx.lineWidth = 14;
+          ctx.beginPath(); ctx.moveTo(bx1, by1); ctx.lineTo(bx2, by2); ctx.stroke();
+          ctx.strokeStyle = 'rgba(255,235,240,0.95)';
+          ctx.lineWidth = 4;
+          ctx.beginPath(); ctx.moveTo(bx1, by1); ctx.lineTo(bx2, by2); ctx.stroke();
+          if (!over && started) {
+            var bd = B3.kind === 'h' ? Math.abs(ship.y - B3.pos)
+                   : (B3.kind === 'v' ? Math.abs(ship.x - B3.pos)
+                   : Math.abs((ship.x - W / 2) * Math.sin(B3.ang) - (ship.y - H / 2) * Math.cos(B3.ang)));
+            if (bd < 13) hurt();
+          }
+        }
+      }
+      ctx.globalCompositeOperation = 'source-over';
+      // The Final Boss mothership at the top (it charges up before each wave)
+      ctx.save();
+      ctx.translate(W / 2, 48);
+      ctx.scale(2, 2);
+      drawUfo({ x: 0, y: 0, t: survived, charge: waveT < 0.6 ? 1 - waveT / 0.6 : 0, slot: 2 });
+      ctx.restore();
+    }
+
+    // Level 3: starts with 2 UFOs, +1 more every 13 seconds
+    if (!over && started && level === 3) {
+      var wantUfos = 2 + Math.floor((survived - levelStart) / 13);
+      while (ufos.length < wantUfos) {
+        var side = Math.floor(Math.random() * 4), sx, sy;
+        if (side === 0) { sx = -50; sy = 60 + Math.random() * (H - 120); }
+        else if (side === 1) { sx = W + 50; sy = 60 + Math.random() * (H - 120); }
+        else if (side === 2) { sx = 60 + Math.random() * (W - 120); sy = -50; }
+        else { sx = 60 + Math.random() * (W - 120); sy = H + 50; }
+        ufos.push({
+          slot: ufos.length, dead: false, x: sx, y: sy,
+          vx: 0, vy: 0, gx: W / 2, gy: H / 2, goalT: 0,
+          fireT: 3 + Math.random() * 2, charge: 0, t: 0
+        });
+        ufoWarnText = ufos.length <= 2 ? 'UFO incoming!' : '+1 UFO!';
+        ufoWarn = 2.5;
+      }
+    }
+    // UFO #1 arrives at 60 seconds, UFO #2 at 2 minutes
+    if (!over && started) {
+      for (var slot = 0; slot < (level >= 3 ? 0 : (level === 2 ? 2 : 1)); slot++) {
+        var has = false;
+        for (var uj = 0; uj < ufos.length; uj++) if (ufos[uj].slot === slot) has = true;
+        var nextOk = slot === 0 ? ufoNext : (slot === 1 ? ufoNext2 : ufoNext3);
+        if (!has && survived >= Math.max(level >= 2 ? levelStart + slot * 15 : 30, nextOk)) {
+          var fromLeft = Math.random() < 0.5;
+          ufos.push({
+            slot: slot, dead: false,
+            x: fromLeft ? -50 : W + 50, y: 60 + Math.random() * (H - 120),
+            vx: 0, vy: 0, gx: W / 2, gy: H / 2, goalT: 0,
+            fireT: 3.5, charge: 0, t: 0
+          });
+          ufoWarnText = slot === 0 ? 'UFO incoming!' : (slot === 1 ? 'SECOND UFO incoming!' : 'THIRD UFO incoming!');
+          ufoWarn = 2.5;
+        }
+      }
+    }
+    if (ufoWarn > 0) ufoWarn -= dt;
+    for (var ui = ufos.length - 1; ui >= 0; ui--) {
+      var ufo = ufos[ui];
+      if (!over) {
+        ufo.t += dt;
+        // Pick a new spot near your ship every few seconds
+        ufo.goalT -= dt;
+        if (ufo.goalT <= 0 && level === 3) {
+          // Level 3: the UFO automatically runs to the safest spot away from your ship
+          ufo.goalT = 0.35;
+          var bestScore = -1e9;
+          for (var gc = 0; gc < 14; gc++) {
+            var gcx = 45 + Math.random() * (W - 90), gcy = 45 + Math.random() * (H - 90);
+            var sc = Math.hypot(gcx - ship.x, gcy - ship.y) - 0.3 * Math.hypot(gcx - ufo.x, gcy - ufo.y);
+            for (var uo = 0; uo < ufos.length; uo++) {
+              if (ufos[uo] !== ufo) sc += 0.5 * Math.min(200, Math.hypot(gcx - ufos[uo].x, gcy - ufos[uo].y));
+            }
+            if (sc > bestScore) { bestScore = sc; ufo.gx = gcx; ufo.gy = gcy; }
+          }
+        } else if (ufo.goalT <= 0) {
+          ufo.goalT = 2 + Math.random() * 2;
+          var ga = Math.random() * Math.PI * 2;
+          ufo.gx = Math.max(50, Math.min(W - 50, ship.x + Math.cos(ga) * 170));
+          ufo.gy = Math.max(50, Math.min(H - 50, ship.y + Math.sin(ga) * 170));
+        }
+        var ux = ufo.gx - ufo.x, uy = ufo.gy - ufo.y, ud = Math.hypot(ux, uy) || 1;
+        ufo.vx += (ux / ud) * (level === 3 ? 240 : 105) * dt;
+        ufo.vy += (uy / ud) * (level === 3 ? 240 : 105) * dt;
+        if (level === 3) {
+          // Level 3: UFOs push away from each other so they stay spread out
+          for (var so = 0; so < ufos.length; so++) {
+            if (ufos[so] === ufo) continue;
+            var sdx = ufo.x - ufos[so].x, sdy = ufo.y - ufos[so].y, sd = Math.hypot(sdx, sdy) || 1;
+            if (sd < 170) {
+              var spush = (1 - sd / 170) * 300 * dt;
+              ufo.vx += (sdx / sd) * spush;
+              ufo.vy += (sdy / sd) * spush;
+            }
+          }
+        }
+        var uv = Math.pow(0.4, dt);
+        ufo.vx *= uv; ufo.vy *= uv;
+        var us = Math.hypot(ufo.vx, ufo.vy);
+        var ufoCap = level === 3 ? 140 : 75; // level 3 UFOs are faster than your ship, so you cannot catch them
+        if (us > ufoCap) { ufo.vx *= ufoCap / us; ufo.vy *= ufoCap / us; }
+        ufo.x += ufo.vx * dt;
+        ufo.y += ufo.vy * dt;
+        // Charge up, then fire a laser straight at the ship
+        ufo.fireT -= dt;
+        ufo.charge = ufo.fireT < 0.45 ? 1 - ufo.fireT / 0.45 : 0;
+        if (ufo.fireT <= 0) {
+          ufo.fireT = Math.max(0.9, (3.7 + Math.random() * 0.8) / fireRate);
+          var la = Math.atan2(ship.y - ufo.y, ship.x - ufo.x);
+          lasers.push({ x: ufo.x, y: ufo.y + 8, vx: Math.cos(la) * 170, vy: Math.sin(la) * 170, life: 0 });
+        }
+        // Touching the UFO: invincible = destroy it, otherwise lose a life
+        if (Math.hypot(ship.x - ufo.x, ship.y - ufo.y) < 34) {
+          if (shield > 0) {
+            burst(ufo.x, ufo.y, 60, 'fire', 170);
+            ufo.dead = true;
+            if (ufo.slot === 0) ufoNext = level === 1 ? Infinity : survived + 15; else if (ufo.slot === 1) ufoNext2 = survived + 15; else ufoNext3 = survived + 15;
+            toastText = 'UFO DESTROYED!'; toastT = 1.8;
+          } else if (invuln <= 0) {
+            var ka = Math.atan2(ship.y - ufo.y, ship.x - ufo.x);
+            hurt();
+            if (!over) { ship.vx = Math.cos(ka) * 140; ship.vy = Math.sin(ka) * 140; }
+          }
+        }
+      }
+      if (ufo.dead) ufos.splice(ui, 1); else drawUfo(ufo);
+    }
+
+    // Lasers
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    for (var li = lasers.length - 1; li >= 0; li--) {
+      var Ls = lasers[li];
+      if (!over) {
+        Ls.life += dt;
+        Ls.x += Ls.vx * dt;
+        Ls.y += Ls.vy * dt;
+      }
+      if (Ls.life > 3 || Ls.x < -20 || Ls.x > W + 20 || Ls.y < -20 || Ls.y > H + 20) {
+        lasers.splice(li, 1);
+        continue;
+      }
+      var lsp = Math.hypot(Ls.vx, Ls.vy);
+      var tx = Ls.x - (Ls.vx / lsp) * 16, ty = Ls.y - (Ls.vy / lsp) * 16;
+      ctx.strokeStyle = 'rgba(255,40,80,0.35)';
+      ctx.lineWidth = 6;
+      ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(Ls.x, Ls.y); ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,210,220,0.95)';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(Ls.x, Ls.y); ctx.stroke();
+      if (!over) {
+        var lnx = ship.x + Math.cos(ship.angle) * 15, lny = ship.y + Math.sin(ship.angle) * 15;
+        if (Math.hypot(Ls.x - ship.x, Ls.y - ship.y) < 13 || Math.hypot(Ls.x - lnx, Ls.y - lny) < 8) {
+          if (shield > 0) { burst(Ls.x, Ls.y, 8, 'cool', 90); lasers.splice(li, 1); continue; }
+          if (invuln <= 0) { hurt(); lasers.splice(li, 1); continue; }
+        }
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.lineCap = 'butt';
+
+    // Ship hitbox (press H to show)
+    if (showHit && !over) {
+      ctx.strokeStyle = 'rgba(255,60,60,0.9)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(ship.x, ship.y, 11, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(ship.x + Math.cos(ship.angle) * 15, ship.y + Math.sin(ship.angle) * 15, 6, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // Exhaust particles come out of the back of the ship
+    var fx = Math.cos(ship.angle), fy = Math.sin(ship.angle);
+    var bx = -fx, by = -fy;
+    if (moving) {
+      emitAcc += 150 * dt;
+      while (emitAcc >= 1 && particles.length < 450) {
+        emitAcc -= 1;
+        var spd = 60 + Math.random() * 70;
+        var side = (Math.random() - 0.5) * 30;
+        var nz = Math.random() < 0.5 ? -2.75 : 2.75; // twin engine nozzles
+        particles.push({
+          x: ship.x + bx * 19 - by * nz + (Math.random() - 0.5) * 1.5,
+          y: ship.y + by * 19 + bx * nz + (Math.random() - 0.5) * 1.5,
+          vx: ship.vx + bx * spd - by * side,
+          vy: ship.vy + by * spd + bx * side,
+          life: 0, max: 0.4 + Math.random() * 0.5,
+          size: 0.5 + Math.random() * 0.8, cool: false
+        });
+      }
+    }
+    // Brake puffs come out of the front
+    if (keys.down && Math.hypot(ship.vx, ship.vy) > 8) {
+      brakeAcc += 70 * dt;
+      while (brakeAcc >= 1 && particles.length < 450) {
+        brakeAcc -= 1;
+        var bs = (Math.random() - 0.5) * 70;
+        particles.push({
+          x: ship.x + fx * 22,
+          y: ship.y + fy * 22,
+          vx: ship.vx * 0.6 + fx * 60 - fy * bs,
+          vy: ship.vy * 0.6 + fy * 60 + fx * bs,
+          life: 0, max: 0.3 + Math.random() * 0.3,
+          size: 0.4 + Math.random() * 0.6, cool: true
+        });
+      }
+    }
+
+    // Update and draw particles (additive glow)
+    ctx.globalCompositeOperation = 'lighter';
+    for (var pi = particles.length - 1; pi >= 0; pi--) {
+      var p = particles[pi];
+      p.life += dt;
+      if (p.life >= p.max) { particles.splice(pi, 1); continue; }
+      var pd = Math.pow(0.35, dt);
+      p.vx *= pd; p.vy *= pd;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      var t = p.life / p.max, cr, cg, cb, ca, sz;
+      if (p.rock) {
+        cr = 190; cg = 160; cb = 130; ca = (1 - t) * 0.9;
+        sz = p.size * (1 - t * 0.4);
+      } else if (p.cool) {
+        cr = 150; cg = 205; cb = 255; ca = (1 - t) * 0.8;
+        sz = p.size * (1 - t * 0.5);
+      } else {
+        var c = fireColor(t);
+        cr = c[0]; cg = c[1]; cb = c[2]; ca = c[3];
+        sz = p.size * (1 + t * 0.5);
+      }
+      ctx.fillStyle = 'rgba(' + (cr | 0) + ',' + (cg | 0) + ',' + (cb | 0) + ',' + ca.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, sz, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+
+    ctx.globalAlpha = over && !won ? 0 : (invuln > 0 && Math.floor(invuln * 10) % 2 === 0 ? 0.3 : 1); // hide after a crash, flicker after a hit
+    // Ship shadow (gives it depth)
+    ctx.save();
+    ctx.translate(ship.x + 3, ship.y + 5);
+    ctx.rotate(ship.angle + Math.PI / 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.beginPath();
+    ctx.moveTo(0, -24); ctx.lineTo(-18, 15); ctx.lineTo(-9, 11); ctx.lineTo(-5, 18);
+    ctx.lineTo(5, 18); ctx.lineTo(9, 11); ctx.lineTo(18, 15);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    // Ship: swept-wing fighter, faceted 3D look (nose points up in local space)
+    ctx.save();
+    ctx.translate(ship.x, ship.y);
+    ctx.rotate(ship.angle + Math.PI / 2);
+    ctx.lineJoin = 'round';
+
+    // Small engine glow at the nozzles
+    if (moving) {
+      ctx.globalCompositeOperation = 'lighter';
+      var glow = ctx.createRadialGradient(0, 18, 1, 0, 18, 9 + Math.random() * 2);
+      glow.addColorStop(0, 'rgba(255,200,120,0.85)');
+      glow.addColorStop(1, 'rgba(255,100,30,0)');
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(0, 18, 11, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    // Left wing (lit)
+    var lw = ctx.createLinearGradient(-18, 15, 0, -24);
+    lw.addColorStop(0, '#7d97d6');
+    lw.addColorStop(1, '#e9f1ff');
+    ctx.fillStyle = lw;
+    ctx.beginPath();
+    ctx.moveTo(0, -24); ctx.lineTo(-18, 15); ctx.lineTo(-9, 11); ctx.lineTo(0, 8);
+    ctx.closePath();
+    ctx.fill();
+
+    // Right wing (in shade)
+    var rw = ctx.createLinearGradient(18, 15, 0, -24);
+    rw.addColorStop(0, '#1f2c66');
+    rw.addColorStop(1, '#566fb8');
+    ctx.fillStyle = rw;
+    ctx.beginPath();
+    ctx.moveTo(0, -24); ctx.lineTo(0, 8); ctx.lineTo(9, 11); ctx.lineTo(18, 15);
+    ctx.closePath();
+    ctx.fill();
+
+    // Red wing-tip accents
+    ctx.fillStyle = '#ff5470';
+    ctx.beginPath();
+    ctx.moveTo(-16.3, 12.8); ctx.lineTo(-14, 7.5); ctx.lineTo(-10.2, 10.8);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#b8203f';
+    ctx.beginPath();
+    ctx.moveTo(16.3, 12.8); ctx.lineTo(14, 7.5); ctx.lineTo(10.2, 10.8);
+    ctx.closePath();
+    ctx.fill();
+
+    // Fuselage, raised above the wings: lit left half, shaded right half
+    var fl = ctx.createLinearGradient(-5, 16, 0, -24);
+    fl.addColorStop(0, '#aebfe8');
+    fl.addColorStop(1, '#ffffff');
+    ctx.fillStyle = fl;
+    ctx.beginPath();
+    ctx.moveTo(0, -24); ctx.lineTo(-5, 6); ctx.lineTo(-4, 16); ctx.lineTo(0, 16);
+    ctx.closePath();
+    ctx.fill();
+    var fr = ctx.createLinearGradient(5, 16, 0, -24);
+    fr.addColorStop(0, '#34468c');
+    fr.addColorStop(1, '#7b93d8');
+    ctx.fillStyle = fr;
+    ctx.beginPath();
+    ctx.moveTo(0, -24); ctx.lineTo(0, 16); ctx.lineTo(4, 16); ctx.lineTo(5, 6);
+    ctx.closePath();
+    ctx.fill();
+
+    // Twin engine nozzles
+    ctx.fillStyle = moving ? '#ffb066' : '#3a4060';
+    ctx.fillRect(-4.5, 16, 3.5, 3);
+    ctx.fillRect(1, 16, 3.5, 3);
+
+    // Cockpit canopy
+    var cp = ctx.createLinearGradient(0, -13, 0, 3);
+    cp.addColorStop(0, '#9be4ff');
+    cp.addColorStop(1, '#16277a');
+    ctx.fillStyle = cp;
+    ctx.beginPath();
+    ctx.moveTo(0, -13); ctx.lineTo(-2.6, -4); ctx.lineTo(0, 3); ctx.lineTo(2.6, -4);
+    ctx.closePath();
+    ctx.fill();
+
+    // Edges and center ridge
+    ctx.strokeStyle = 'rgba(200,225,255,0.85)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, -24); ctx.lineTo(-18, 15); ctx.lineTo(-9, 11); ctx.lineTo(-5, 16);
+    ctx.lineTo(5, 16); ctx.lineTo(9, 11); ctx.lineTo(18, 15);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.beginPath();
+    ctx.moveTo(0, -24); ctx.lineTo(0, 16);
+    ctx.stroke();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+
+    // Invincibility aura
+    if (shield > 0 && !over && (shield > 1.5 || Math.floor(shield * 8) % 2 === 0)) {
+      ctx.globalCompositeOperation = 'lighter';
+      var sr = 27 + Math.sin(performance.now() / 120) * 2;
+      var sg = ctx.createRadialGradient(ship.x, ship.y, 8, ship.x, ship.y, sr);
+      sg.addColorStop(0, 'rgba(255,225,90,0)');
+      sg.addColorStop(0.75, 'rgba(255,225,90,0.25)');
+      sg.addColorStop(1, 'rgba(255,255,200,0.75)');
+      ctx.fillStyle = sg;
+      ctx.beginPath();
+      ctx.arc(ship.x, ship.y, sr, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    // HUD
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font = '16px "Trebuchet MS", "Segoe UI", sans-serif';
+    ctx.textAlign = 'left';
+    if (started) {
+      var lvlName = level === 4 ? 'BOSS' : 'Level ' + level;
+      var lvlLeft = level === 3 ? 60 - (survived - levelStart) : (level === 4 ? 30 - (survived - levelStart) : (level === 1 && !rocket ? 60 - survived : -1));
+      ctx.fillText(lvlName + (lvlLeft >= 0 ? ' (' + Math.max(0, lvlLeft).toFixed(0) + 's left)' : '') + '   Time ' + survived.toFixed(1) + 's', 14, 24);
+      ctx.fillText('Lives ' + lives, 14, 44);
+      if (ammo > 0) { ctx.fillStyle = '#ffb347'; ctx.fillText('Ammo ' + ammo, 14, 64); }
+      if (shield > 0) { ctx.fillStyle = '#ffe14a'; ctx.fillText('Invincible ' + shield.toFixed(1) + 's', 14, ammo > 0 ? 84 : 64); }
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      if (toastT > 0 && !over) {
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ffe14a';
+        ctx.font = 'bold 20px "Trebuchet MS", "Segoe UI", sans-serif';
+        ctx.fillText(toastText, W / 2, 96);
+        ctx.textAlign = 'left';
+        ctx.font = '16px "Trebuchet MS", "Segoe UI", sans-serif';
+        ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      }
+    }
+    if (ufoWarn > 0 && !over && Math.floor(performance.now() / 250) % 2 === 0) {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ff5470';
+      ctx.font = 'bold 22px "Trebuchet MS", "Segoe UI", sans-serif';
+      ctx.fillText(ufoWarnText, W / 2, 52);
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.font = '16px "Trebuchet MS", "Segoe UI", sans-serif';
+    }
+    if (best > 0) {
+      ctx.textAlign = 'right';
+      ctx.fillText('Best ' + best.toFixed(1) + 's', W - 14, 24);
+    }
+
+    // Instant teleport flash (level 3)
+    if (flashT > 0) {
+      flashT -= realDt;
+      var fa = Math.max(0, flashT) / 0.7;
+      ctx.fillStyle = 'rgba(255,255,255,' + (fa * 0.85).toFixed(2) + ')';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(40,10,20,' + fa.toFixed(2) + ')';
+      ctx.font = 'bold 44px "Trebuchet MS", "Segoe UI", sans-serif';
+      ctx.fillText(flashText, W / 2, H / 2 + 14);
+    }
+
+    // Warp effect (level 2)
+    if (warpT > 0) {
+      var wp = 1 - warpT / 1.8;
+      ctx.save();
+      ctx.translate(W / 2, H / 2);
+      ctx.strokeStyle = 'rgba(200,220,255,' + (0.3 + 0.6 * wp).toFixed(2) + ')';
+      ctx.lineWidth = 1.5;
+      for (var wi = 0; wi < 70; wi++) {
+        var wa = wi * 2.399963;
+        var wr = 30 + ((wi * 37) % 200) * (0.4 + 1.6 * wp);
+        var wl = 10 + 140 * wp * (0.5 + ((wi * 53) % 100) / 100);
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(wa) * wr, Math.sin(wa) * wr);
+        ctx.lineTo(Math.cos(wa) * (wr + wl), Math.sin(wa) * (wr + wl));
+        ctx.stroke();
+      }
+      ctx.restore();
+      if (wp > 0.7) {
+        ctx.fillStyle = 'rgba(255,255,255,' + (((wp - 0.7) / 0.3) * 0.9).toFixed(2) + ')';
+        ctx.fillRect(0, 0, W, H);
+      }
+      ctx.textAlign = 'center';
+      ctx.fillStyle = wp > 0.85 ? 'rgba(20,20,60,0.9)' : '#ffffff';
+      ctx.font = 'bold 44px "Trebuchet MS", "Segoe UI", sans-serif';
+      ctx.fillText('LEVEL 2', W / 2, H / 2 + 14);
+    }
+
+    // Front page
+    if (!started) {
+      ctx.fillStyle = 'rgba(3,4,10,0.55)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      var tg = ctx.createLinearGradient(W / 2 - 170, 0, W / 2 + 170, 0);
+      tg.addColorStop(0, '#ff3b3b');
+      tg.addColorStop(0.2, '#ff9a3c');
+      tg.addColorStop(0.4, '#ffe14a');
+      tg.addColorStop(0.6, '#4cd964');
+      tg.addColorStop(0.8, '#3cc8ff');
+      tg.addColorStop(1, '#b44cff');
+      ctx.fillStyle = tg;
+      ctx.font = 'bold 52px "Trebuchet MS", "Segoe UI", sans-serif';
+      ctx.fillText('SPACE DRIFT', W / 2, H / 2 - 72);
+      ctx.fillStyle = '#e8eefc';
+      ctx.font = '18px "Trebuchet MS", "Segoe UI", sans-serif';
+      ctx.fillText('Dodge the rocks and survive as long as you can.', W / 2, H / 2 - 36);
+      ctx.fillStyle = '#ffe14a';
+      ctx.font = 'bold 22px "Trebuchet MS", "Segoe UI", sans-serif';
+      ctx.fillText(best > 0 ? 'High score: ' + best.toFixed(1) + 's' : 'No high score yet', W / 2, H / 2 + 6);
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = '15px "Trebuchet MS", "Segoe UI", sans-serif';
+      ctx.fillText('Left/Right turn, Up thrust, Down brake, Space fire', W / 2, H / 2 + 44);
+      ctx.fillText('A UFO appears at 30 seconds. The rocket comes at 1 minute!', W / 2, H / 2 + 66);
+      ctx.fillText('Power-ups appear every 30 seconds. Grab them fast!', W / 2, H / 2 + 88);
+      if (Math.floor(performance.now() / 500) % 2 === 0) {
+        ctx.fillStyle = '#9be4ff';
+        ctx.font = '20px "Trebuchet MS", "Segoe UI", sans-serif';
+        ctx.fillText('Press Space or tap the square to start', W / 2, H / 2 + 112);
+      }
+    }
+
+    // Game over screen
+    if (over) {
+      ctx.fillStyle = 'rgba(3,4,10,0.6)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ff5470';
+      ctx.font = 'bold 40px "Trebuchet MS", "Segoe UI", sans-serif';
+      if (won) ctx.fillStyle = '#6cff9a';
+      ctx.fillText(won ? 'YOU WIN!' : 'GAME OVER', W / 2, H / 2 - 12);
+      ctx.fillStyle = '#e8eefc';
+      ctx.font = '20px "Trebuchet MS", "Segoe UI", sans-serif';
+      ctx.fillText('You survived ' + survived.toFixed(1) + 's', W / 2, H / 2 + 22);
+      if (newRecord) {
+        ctx.fillStyle = '#ffe14a';
+        ctx.font = 'bold 22px "Trebuchet MS", "Segoe UI", sans-serif';
+        ctx.fillText('NEW HIGH SCORE!', W / 2, H / 2 + 54);
+      } else {
+        ctx.fillStyle = 'rgba(255,225,74,0.9)';
+        ctx.font = '18px "Trebuchet MS", "Segoe UI", sans-serif';
+        ctx.fillText('High score: ' + best.toFixed(1) + 's', W / 2, H / 2 + 52);
+      }
+      var ready = performance.now() - overAt > 600;
+      ctx.fillStyle = ready ? '#9be4ff' : 'rgba(155,228,255,0.35)';
+      ctx.font = '16px "Trebuchet MS", "Segoe UI", sans-serif';
+      ctx.fillText('Press Space or tap the square to restart', W / 2, H / 2 + 86);
+    }
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
